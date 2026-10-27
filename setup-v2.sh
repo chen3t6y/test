@@ -612,6 +612,54 @@ stage_base() {
 }
 
 # ----------------------------------------------------------------- 2. gpu ---
+# 枚举 DRM 卡。card0 不是契约：编号由内核探测顺序决定，多卡、无头独显、
+# 显卡坞都会让「/dev/dri/card0 是否存在」与「能不能出画面」脱钩。
+# 实测反例：iGPU 接显示器 + RX 7900 XTX 无头时，按 card0 判存活会误报失败。
+DRM_CARDS=0
+DRM_CONNECTED=0
+
+drm_survey() {
+    local c drv out st conn rdev
+    DRM_CARDS=0
+    DRM_CONNECTED=0
+
+    # 不依赖 nullglob：无匹配时 glob 保持字面量，由 [[ -d ]] 挡掉。
+    for c in /sys/class/drm/card[0-9]*; do
+        [[ -d "$c" ]] || continue
+        # card[0-9]* 也会匹配 card0-eDP-1 这类连接器目录，必须精确过滤。
+        [[ "$(basename "$c")" =~ ^card[0-9]+$ ]] || continue
+        DRM_CARDS=$((DRM_CARDS + 1))
+
+        drv="$(basename "$(readlink -f "$c/device/driver" 2>/dev/null || true)")"
+        [[ -n "$drv" && "$drv" != "." ]] || drv="unknown"
+
+        conn=0
+        for out in "$c"-*; do
+            [[ -r "$out/status" ]] || continue
+            if [[ "$(<"$out/status")" == "connected" ]]; then
+                conn=$((conn + 1))
+            fi
+        done
+        DRM_CONNECTED=$((DRM_CONNECTED + conn))
+
+        # 同一 PCI 设备下的 render 节点；niri 的 debug.render-drm-device
+        # 要的正是 renderD*，不是 card*。
+        rdev=""
+        for st in /sys/class/drm/renderD[0-9]*; do
+            [[ -d "$st" ]] || continue
+            [[ "$(basename "$st")" =~ ^renderD[0-9]+$ ]] || continue
+            if [[ "$(readlink -f "$st/device" 2>/dev/null || true)" == \
+                  "$(readlink -f "$c/device" 2>/dev/null || true)" ]]; then
+                rdev="/dev/dri/$(basename "$st")"
+                break
+            fi
+        done
+
+        dim "$(printf '    %-7s %-9s %-14s %s output(s) connected' \
+            "$(basename "$c")" "$drv" "${rdev:-no-render-node}" "$conn")"
+    done
+}
+
 stage_gpu() {
     banner "Stage gpu: AMD graphics userspace drivers (01_niri.md section 5)"
 
@@ -625,13 +673,32 @@ stage_gpu() {
     info "Verify"
     if $DRY_RUN; then
         dim "    Skipping hardware check (dry-run)"
-    elif [[ -e /dev/dri/card0 ]]; then
-        ok "/dev/dri/card0 exists"
-        ls -l /dev/dri/ | sed 's/^/    /'
-    else
-        err "/dev/dri/card0 does not exist; do not install the desktop or it will start with a blank screen"
-        err "Check: lsmod | grep amdgpu ; dmesg | grep -i amdgpu"
+        return 0
+    fi
+
+    drm_survey
+
+    if (( DRM_CARDS == 0 )); then
+        err "No card* under /sys/class/drm -- the kernel has no KMS driver bound"
+        err "Do not install the desktop: it will start with a blank screen"
+        err "Check: lspci -nn | grep -iE 'vga|3d|display'"
+        err "Check: lsmod | grep -E '^(amdgpu|i915|xe|radeon)'"
+        err "Check: sudo dmesg | grep -iE 'amdgpu|i915|xe|drm' | tail -30"
         return 1
+    fi
+
+    if (( DRM_CONNECTED == 0 )); then
+        # 无头机器或纯 SSH 装机时的正常状态；不拦截，只是提醒。
+        warn "DRM cards found, but no connector reports 'connected'"
+        warn "Expected on a headless machine or when installing over SSH;"
+        warn "attach a monitor before logging into niri or the output stays blank"
+    else
+        ok "${DRM_CONNECTED} connected output(s) across ${DRM_CARDS} DRM card(s)"
+    fi
+
+    if (( DRM_CARDS > 1 && DRM_CONNECTED > 0 )); then
+        dim "    Multiple GPUs: niri renders on the card that has the connected output."
+        dim "    To pin it explicitly, use debug { render-drm-device \"/dev/dri/renderD12X\" } in config.kdl"
     fi
 }
 
